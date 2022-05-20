@@ -1,29 +1,29 @@
 /*
- * modeset - DRM Modesetting Example
+ * modeset - DRM Double-Buffered Modesetting Example
  *
  * Written 2012 by David Rheinsberg <david.rheinsberg@gmail.com>
  * Dedicated to the Public Domain.
  */
 
 /*
- * DRM Modesetting Howto
- * This document describes the DRM modesetting API. Before we can use the DRM
- * API, we have to include xf86drm.h and xf86drmMode.h. Both are provided by
- * libdrm which every major distribution ships by default. It has no other
- * dependencies and is pretty small.
+ * DRM Double-Buffered Modesetting Howto
+ * This example extends the modeset.c howto and introduces double-buffering.
+ * When drawing a new frame into a framebuffer, we should always draw into an
+ * unused buffer and not into the front buffer. If we draw into the front
+ * buffer, we might have drawn half the frame when the display-controller starts
+ * scanning out the next frame. Hence, we see flickering on the screen.
+ * The technique to avoid this is called double-buffering. We have two
+ * framebuffers, the front buffer which is currently used for scanout and a
+ * back-buffer that is used for drawing operations. When a frame is done, we
+ * simply swap both buffers.
+ * Swapping does not mean copying data, instead, only the pointers to the
+ * buffers are swapped.
  *
- * Please ignore all forward-declarations of functions which are used later. I
- * reordered the functions so you can read this document from top to bottom. If
- * you reimplement it, you would probably reorder the functions to avoid all the
- * nasty forward declarations.
- *
- * For easier reading, we ignore all memory-allocation errors of malloc() and
- * friends here. However, we try to correctly handle all other kinds of errors
- * that may occur.
- *
- * All functions and global variables are prefixed with "modeset_*" in this
- * file. So it should be clear whether a function is a local helper or if it is
- * provided by some external library.
+ * Please read modeset.c before reading this file as most of the functions stay
+ * the same. Only the differences are highlighted here.
+ * Also note that triple-buffering or any other number of buffers can be easily
+ * implemented by following the scheme here. However, in this example we limit
+ * the number of buffers to 2 so it is easier to follow.
  */
 
 #define _GNU_SOURCE
@@ -40,40 +40,21 @@
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 
+struct modeset_buf;
 struct modeset_dev;
 static int modeset_find_crtc(int fd, drmModeRes *res, drmModeConnector *conn,
                              struct modeset_dev *dev);
-static int modeset_create_fb(int fd, struct modeset_dev *dev);
+static int modeset_create_fb(int fd, struct modeset_buf *buf);
+static void modeset_destroy_fb(int fd, struct modeset_buf *buf);
 static int modeset_setup_dev(int fd, drmModeRes *res, drmModeConnector *conn,
                              struct modeset_dev *dev);
 static int modeset_open(int *out, const char *node);
 static int modeset_prepare(int fd);
-static void modeset_draw(void);
+static void modeset_draw(int fd);
 static void modeset_cleanup(int fd);
 
 /*
- * When the linux kernel detects a graphics-card on your machine, it loads the
- * correct device driver (located in kernel-tree at ./drivers/gpu/drm/<xy>) and
- * provides two character-devices to control it. Udev (or whatever hotplugging
- * application you use) will create them as:
- *     /dev/dri/card0
- *     /dev/dri/controlID64
- * We only need the first one. You can hard-code this path into your application
- * like we do here, but it is recommended to use libudev with real hotplugging
- * and multi-seat support. However, this is beyond the scope of this document.
- * Also note that if you have multiple graphics-cards, there may also be
- * /dev/dri/card1, /dev/dri/card2, ...
- *
- * We simply use /dev/dri/card0 here but the user can specify another path on
- * the command line.
- *
- * modeset_open(out, node): This small helper function opens the DRM device
- * which is given as @node. The new fd is stored in @out on success. On failure,
- * a negative error code is returned.
- * After opening the file, we also check for the DRM_CAP_DUMB_BUFFER capability.
- * If the driver supports this capability, we can create simple memory-mapped
- * buffers without any driver-dependent code. As we want to avoid any radeon,
- * nvidia, intel, etc. specific code, we depend on DUMB_BUFFERs here.
+ * modeset_open() stays the same as before.
  */
 
 static int modeset_open(int *out, const char *node) {
@@ -98,62 +79,41 @@ static int modeset_open(int *out, const char *node) {
 }
 
 /*
- * As a next step we need to find our available display devices. libdrm provides
- * a drmModeRes structure that contains all the needed information. We can
- * retrieve it via drmModeGetResources(fd) and free it via
- * drmModeFreeResources(res) again.
+ * Previously, we used the modeset_dev objects to hold buffer informations, too.
+ * Technically, we could have split them but avoided this to make the
+ * example simpler.
+ * However, in this example we need 2 buffers. One back buffer and one front
+ * buffer. So we introduce a new structure modeset_buf which contains everything
+ * related to a single buffer. Each device now gets an array of two of these
+ * buffers.
+ * Each buffer consists of width, height, stride, size, handle, map and fb-id.
+ * They have the same meaning as before.
  *
- * A physical connector on your graphics card is called a "connector". You can
- * plug a monitor into it and control what is displayed. We are definitely
- * interested in what connectors are currently used, so we simply iterate
- * through the list of connectors and try to display a test-picture on each
- * available monitor.
- * However, this isn't as easy as it sounds. First, we need to check whether the
- * connector is actually used (a monitor is plugged in and turned on). Then we
- * need to find a CRTC that can control this connector. CRTCs are described
- * later on. After that we create a framebuffer object. If we have all this, we
- * can mmap() the framebuffer and draw a test-picture into it. Then we can tell
- * the DRM device to show the framebuffer on the given CRTC with the selected
- * connector.
+ * Each device also gets a new integer field: front_buf. This field contains the
+ * index of the buffer that is currently used as front buffer / scanout buffer.
+ * In our example it can be 0 or 1. We flip it by using XOR:
+ *   dev->front_buf ^= dev->front_buf
  *
- * As we want to draw moving pictures on the framebuffer, we actually have to
- * remember all these settings. Therefore, we create one "struct modeset_dev"
- * object for each connector+crtc+framebuffer pair that we successfully
- * initialized and push it into the global device-list.
- *
- * Each field of this structure is described when it is first used. But as a
- * summary:
- * "struct modeset_dev" contains: {
- *  - @next: points to the next device in the single-linked list
- *
- *  - @width: width of our buffer object
- *  - @height: height of our buffer object
- *  - @stride: stride value of our buffer object
- *  - @size: size of the memory mapped buffer
- *  - @handle: a DRM handle to the buffer object that we can draw into
- *  - @map: pointer to the memory mapped buffer
- *
- *  - @mode: the display mode that we want to use
- *  - @fb: a framebuffer handle with our buffer object as scanout buffer
- *  - @conn: the connector ID that we want to use with this buffer
- *  - @crtc: the crtc ID that we want to use with this connector
- *  - @saved_crtc: the configuration of the crtc before we changed it. We use it
- *                 so we can restore the same mode when we exit.
- * }
+ * Everything else stays the same.
  */
 
-struct modeset_dev {
-  struct modeset_dev *next;
-
+struct modeset_buf {
   uint32_t width;
   uint32_t height;
   uint32_t stride;
   uint32_t size;
   uint32_t handle;
   uint8_t *map;
+  uint32_t fb;
+};
+
+struct modeset_dev {
+  struct modeset_dev *next;
+
+  unsigned int front_buf;
+  struct modeset_buf bufs[2];
 
   drmModeModeInfo mode;
-  uint32_t fb;
   uint32_t conn;
   uint32_t crtc;
   drmModeCrtc *saved_crtc;
@@ -162,22 +122,7 @@ struct modeset_dev {
 static struct modeset_dev *modeset_list = NULL;
 
 /*
- * So as next step we need to actually prepare all connectors that we find. We
- * do this in this little helper function:
- *
- * modeset_prepare(fd): This helper function takes the DRM fd as argument and
- * then simply retrieves the resource-info from the device. It then iterates
- * through all connectors and calls other helper functions to initialize this
- * connector (described later on).
- * If the initialization was successful, we simply add this object as new device
- * into the global modeset device list.
- *
- * The resource-structure contains a list of all connector-IDs. We use the
- * helper function drmModeGetConnector() to retrieve more information on each
- * connector. After we are done with it, we free it again with
- * drmModeFreeConnector().
- * Our helper modeset_setup_dev() returns -ENOENT if the connector is currently
- * unused and no monitor is plugged in. So we can ignore this connector.
+ * modeset_prepare() stays the same.
  */
 
 static int modeset_prepare(int fd) {
@@ -234,32 +179,11 @@ static int modeset_prepare(int fd) {
 }
 
 /*
- * Now we dig deeper into setting up a single connector. As described earlier,
- * we need to check several things first:
- *   * If the connector is currently unused, that is, no monitor is plugged in,
- *     then we can ignore it.
- *   * We have to find a suitable resolution and refresh-rate. All this is
- *     available in drmModeModeInfo structures saved for each crtc. We simply
- *     use the first mode that is available. This is always the mode with the
- *     highest resolution.
- *     A more sophisticated mode-selection should be done in real applications,
- *     though.
- *   * Then we need to find an CRTC that can drive this connector. A CRTC is an
- *     internal resource of each graphics-card. The number of CRTCs controls how
- *     many connectors can be controlled indepedently. That is, a graphics-cards
- *     may have more connectors than CRTCs, which means, not all monitors can be
- *     controlled independently.
- *     There is actually the possibility to control multiple connectors via a
- *     single CRTC if the monitors should display the same content. However, we
- *     do not make use of this here.
- *     So think of connectors as pipelines to the connected monitors and the
- *     CRTCs are the controllers that manage which data goes to which pipeline.
- *     If there are more pipelines than CRTCs, then we cannot control all of
- *     them at the same time.
- *   * We need to create a framebuffer for this connector. A framebuffer is a
- *     memory buffer that we can write XRGB32 data into. So we use this to
- *     render our graphics and then the CRTC can scan-out this data from the
- *     framebuffer onto the monitor.
+ * modeset_setup_dev() sets up all resources for a single device. It mostly
+ * stays the same, but one thing changes: We allocate two framebuffers instead
+ * of one. That is, we call modeset_create_fb() twice.
+ * We also copy the width/height information into both framebuffers so
+ * modeset_create_fb() can use them without requiring a pointer to modeset_dev.
  */
 
 static int modeset_setup_dev(int fd, drmModeRes *res, drmModeConnector *conn,
@@ -278,12 +202,15 @@ static int modeset_setup_dev(int fd, drmModeRes *res, drmModeConnector *conn,
     return -EFAULT;
   }
 
-  /* copy the mode information into our device structure */
+  /* copy the mode information into our device structure and into both
+   * buffers */
   memcpy(&dev->mode, &conn->modes[0], sizeof(dev->mode));
-  dev->width = conn->modes[0].hdisplay;
-  dev->height = conn->modes[0].vdisplay;
+  dev->bufs[0].width = conn->modes[0].hdisplay;
+  dev->bufs[0].height = conn->modes[0].vdisplay;
+  dev->bufs[1].width = conn->modes[0].hdisplay;
+  dev->bufs[1].height = conn->modes[0].vdisplay;
   fprintf(stderr, "mode for connector %u is %ux%u\n", conn->connector_id,
-          dev->width, dev->height);
+          dev->bufs[0].width, dev->bufs[0].height);
 
   /* find a crtc for this connector */
   ret = modeset_find_crtc(fd, res, conn, dev);
@@ -292,11 +219,20 @@ static int modeset_setup_dev(int fd, drmModeRes *res, drmModeConnector *conn,
     return ret;
   }
 
-  /* create a framebuffer for this CRTC */
-  ret = modeset_create_fb(fd, dev);
+  /* create framebuffer #1 for this CRTC */
+  ret = modeset_create_fb(fd, &dev->bufs[0]);
   if (ret) {
     fprintf(stderr, "cannot create framebuffer for connector %u\n",
             conn->connector_id);
+    return ret;
+  }
+
+  /* create framebuffer #2 for this CRTC */
+  ret = modeset_create_fb(fd, &dev->bufs[1]);
+  if (ret) {
+    fprintf(stderr, "cannot create framebuffer for connector %u\n",
+            conn->connector_id);
+    modeset_destroy_fb(fd, &dev->bufs[0]);
     return ret;
   }
 
@@ -304,25 +240,7 @@ static int modeset_setup_dev(int fd, drmModeRes *res, drmModeConnector *conn,
 }
 
 /*
- * modeset_find_crtc(fd, res, conn, dev): This small helper tries to find a
- * suitable CRTC for the given connector. We have actually have to introduce one
- * more DRM object to make this more clear: Encoders.
- * Encoders help the CRTC to convert data from a framebuffer into the right
- * format that can be used for the chosen connector. We do not have to
- * understand any more of these conversions to make use of it. However, you must
- * know that each connector has a limited list of encoders that it can use. And
- * each encoder can only work with a limited list of CRTCs. So what we do is
- * trying each encoder that is available and looking for a CRTC that this
- * encoder can work with. If we find the first working combination, we are happy
- * and write it into the @dev structure.
- * But before iterating all available encoders, we first try the currently
- * active encoder+crtc on a connector to avoid a full modeset.
- *
- * However, before we can use a CRTC we must make sure that no other device,
- * that we setup previously, is already using this CRTC. Remember, we can only
- * drive one connector per CRTC! So we simply iterate through the "modeset_list"
- * of previously setup devices and check that this CRTC wasn't used before.
- * Otherwise, we continue with the next CRTC/Encoder combination.
+ * modeset_find_crtc() stays the same.
  */
 
 static int modeset_find_crtc(int fd, drmModeRes *res, drmModeConnector *conn,
@@ -402,31 +320,13 @@ static int modeset_find_crtc(int fd, drmModeRes *res, drmModeConnector *conn,
 }
 
 /*
- * modeset_create_fb(fd, dev): After we have found a crtc+connector+mode
- * combination, we need to actually create a suitable framebuffer that we can
- * use with it. There are actually two ways to do that:
- *   * We can create a so called "dumb buffer". This is a buffer that we can
- *     memory-map via mmap() and every driver supports this. We can use it for
- *     unaccelerated software rendering on the CPU.
- *   * We can use libgbm to create buffers available for hardware-acceleration.
- *     libgbm is an abstraction layer that creates these buffers for each
- *     available DRM driver. As there is no generic API for this, each driver
- *     provides its own way to create these buffers.
- *     We can then use such buffers to create OpenGL contexts with the mesa3D
- *     library.
- * We use the first solution here as it is much simpler and doesn't require any
- * external libraries. However, if you want to use hardware-acceleration via
- * OpenGL, it is actually pretty easy to create such buffers with libgbm and
- * libEGL. But this is beyond the scope of this document.
- *
- * So what we do is requesting a new dumb-buffer from the driver. We specify the
- * same size as the current mode that we selected for the connector.
- * Then we request the driver to prepare this buffer for memory mapping. After
- * that we perform the actual mmap() call. So we can now access the framebuffer
- * memory directly via the dev->map memory map.
+ * modeset_create_fb() is mostly the same as before. Buf instead of writing the
+ * fields of a modeset_dev, we now require a buffer pointer passed as @buf.
+ * Please note that buf->width and buf->height are initialized by
+ * modeset_setup_dev() so we can use them here.
  */
 
-static int modeset_create_fb(int fd, struct modeset_dev *dev) {
+static int modeset_create_fb(int fd, struct modeset_buf *buf) {
   struct drm_mode_create_dumb creq;
   struct drm_mode_destroy_dumb dreq;
   struct drm_mode_map_dumb mreq;
@@ -434,21 +334,21 @@ static int modeset_create_fb(int fd, struct modeset_dev *dev) {
 
   /* create dumb buffer */
   memset(&creq, 0, sizeof(creq));
-  creq.width = dev->width;
-  creq.height = dev->height;
+  creq.width = buf->width;
+  creq.height = buf->height;
   creq.bpp = 32;
   ret = drmIoctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, &creq);
   if (ret < 0) {
     fprintf(stderr, "cannot create dumb buffer (%d): %m\n", errno);
     return -errno;
   }
-  dev->stride = creq.pitch;
-  dev->size = creq.size;
-  dev->handle = creq.handle;
+  buf->stride = creq.pitch;
+  buf->size = creq.size;
+  buf->handle = creq.handle;
 
   /* create framebuffer object for the dumb-buffer */
-  ret = drmModeAddFB(fd, dev->width, dev->height, 24, 32, dev->stride,
-                     dev->handle, &dev->fb);
+  ret = drmModeAddFB(fd, buf->width, buf->height, 24, 32, buf->stride,
+                     buf->handle, &buf->fb);
   if (ret) {
     fprintf(stderr, "cannot create framebuffer (%d): %m\n", errno);
     ret = -errno;
@@ -457,7 +357,7 @@ static int modeset_create_fb(int fd, struct modeset_dev *dev) {
 
   /* prepare buffer for memory mapping */
   memset(&mreq, 0, sizeof(mreq));
-  mreq.handle = dev->handle;
+  mreq.handle = buf->handle;
   ret = drmIoctl(fd, DRM_IOCTL_MODE_MAP_DUMB, &mreq);
   if (ret) {
     fprintf(stderr, "cannot map dumb buffer (%d): %m\n", errno);
@@ -466,67 +366,62 @@ static int modeset_create_fb(int fd, struct modeset_dev *dev) {
   }
 
   /* perform actual memory mapping */
-  dev->map =
-      mmap(0, dev->size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, mreq.offset);
-  if (dev->map == MAP_FAILED) {
+  buf->map =
+      mmap(0, buf->size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, mreq.offset);
+  if (buf->map == MAP_FAILED) {
     fprintf(stderr, "cannot mmap dumb buffer (%d): %m\n", errno);
     ret = -errno;
     goto err_fb;
   }
 
   /* clear the framebuffer to 0 */
-  memset(dev->map, 0, dev->size);
+  memset(buf->map, 0, buf->size);
 
   return 0;
 
 err_fb:
-  drmModeRmFB(fd, dev->fb);
+  drmModeRmFB(fd, buf->fb);
 err_destroy:
   memset(&dreq, 0, sizeof(dreq));
-  dreq.handle = dev->handle;
+  dreq.handle = buf->handle;
   drmIoctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dreq);
   return ret;
 }
 
 /*
- * Finally! We have a connector with a suitable CRTC. We know which mode we want
- * to use and we have a framebuffer of the correct size that we can write to.
- * There is nothing special left to do. We only have to program the CRTC to
- * connect each new framebuffer to each selected connector for each combination
- * that we saved in the global modeset_list.
- * This is done with a call to drmModeSetCrtc().
- *
- * So we are ready for our main() function. First we check whether the user
- * specified a DRM device on the command line, otherwise we use the default
- * /dev/dri/card0. Then we open the device via modeset_open(). modeset_prepare()
- * prepares all connectors and we can loop over "modeset_list" and call
- * drmModeSetCrtc() on every CRTC/connector combination.
- *
- * But printing empty black pages is boring so we have another helper function
- * modeset_draw() that draws some colors into the framebuffer for 5 seconds and
- * then returns. And then we have all the cleanup functions which correctly free
- * all devices again after we used them. All these functions are described below
- * the main() function.
- *
- * As a side note: drmModeSetCrtc() actually takes a list of connectors that we
- * want to control with this CRTC. We pass only one connector, though. As
- * explained earlier, if we used multiple connectors, then all connectors would
- * have the same controlling framebuffer so the output would be cloned. This is
- * most often not what you want so we avoid explaining this feature here.
- * Furthermore, all connectors will have to run with the same mode, which is
- * also often not guaranteed. So instead, we only use one connector per CRTC.
- *
- * Before calling drmModeSetCrtc() we also save the current CRTC configuration.
- * This is used in modeset_cleanup() to restore the CRTC to the same mode as was
- * before we changed it.
- * If we don't do this, the screen will stay blank after we exit until another
- * application performs modesetting itself.
+ * modeset_destroy_fb() is a new function. It does exactly the reverse of
+ * modeset_create_fb() and destroys a single framebuffer. The modeset.c example
+ * used to do this directly in modeset_cleanup().
+ * We simply unmap the buffer, remove the drm-FB and destroy the memory buffer.
+ */
+
+static void modeset_destroy_fb(int fd, struct modeset_buf *buf) {
+  struct drm_mode_destroy_dumb dreq;
+
+  /* unmap buffer */
+  munmap(buf->map, buf->size);
+
+  /* delete framebuffer */
+  drmModeRmFB(fd, buf->fb);
+
+  /* delete dumb buffer */
+  memset(&dreq, 0, sizeof(dreq));
+  dreq.handle = buf->handle;
+  drmIoctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dreq);
+}
+
+/*
+ * main() also stays almost exactly the same as before. We only need to change
+ * the way that we initially set the CRTCs. Instead of using the buffer
+ * information from modeset_dev, we now use dev->bufs[iter->front_buf] to get
+ * the current front-buffer and use this framebuffer for drmModeSetCrtc().
  */
 
 int main(int argc, char **argv) {
   int ret, fd;
   const char *card;
   struct modeset_dev *iter;
+  struct modeset_buf *buf;
 
   /* check which DRM device to open */
   if (argc > 1)
@@ -549,7 +444,8 @@ int main(int argc, char **argv) {
   /* perform actual modesetting on each found connector+CRTC */
   for (iter = modeset_list; iter; iter = iter->next) {
     iter->saved_crtc = drmModeGetCrtc(fd, iter->crtc);
-    ret = drmModeSetCrtc(fd, iter->crtc, iter->fb, 0, 0, &iter->conn, 1,
+    buf = &iter->bufs[iter->front_buf];
+    ret = drmModeSetCrtc(fd, iter->crtc, buf->fb, 0, 0, &iter->conn, 1,
                          &iter->mode);
     if (ret)
       fprintf(stderr, "cannot set CRTC for connector %u (%d): %m\n", iter->conn,
@@ -557,7 +453,7 @@ int main(int argc, char **argv) {
   }
 
   /* draw some colors for 5seconds */
-  modeset_draw();
+  modeset_draw(fd);
 
   /* cleanup everything */
   modeset_cleanup(fd);
@@ -594,30 +490,46 @@ static uint8_t next_color(bool *up, uint8_t cur, unsigned int mod) {
 }
 
 /*
- * modeset_draw(): This draws a solid color into all configured framebuffers.
- * Every 100ms the color changes to a slightly different color so we get some
- * kind of smoothly changing color-gradient.
+ * modeset_draw() is the place where things change. The render-logic is the same
+ * and we still draw a solid-color on the whole screen. However, we now have two
+ * buffers and need to flip between them.
  *
- * The color calculation can be ignored as it is pretty boring. So the
- * interesting stuff is iterating over "modeset_list" and then through all lines
- * and width. We then set each pixel individually to the current color.
+ * So before drawing into a framebuffer, we need to find the back-buffer.
+ * Remember, dev->font_buf is the index of the front buffer, so
+ * dev->front_buf ^ 1 is the index of the back buffer. We simply use
+ * dev->bufs[dev->front_buf ^ 1] to get the back-buffer and draw into it.
  *
- * We do this 50 times as we sleep 100ms after each redraw round. This makes
- * 50*100ms = 5000ms = 5s so it takes about 5seconds to finish this loop.
+ * After we finished drawing, we need to flip the buffers. We do this with the
+ * same call as we initially set the CRTC: drmModeSetCrtc(). However, we now
+ * pass the back-buffer as new framebuffer as we want to flip them.
+ * The only thing left to do is to change the dev->front_buf index to point to
+ * the new back-buffer (which was previously the front buffer).
+ * We then sleep for a short time period and start drawing again.
  *
- * Please note that we draw directly into the framebuffer. This means that you
- * will see flickering as the monitor might refresh while we redraw the screen.
- * To avoid this you would need to use two framebuffers and a call to
- * drmModeSetCrtc() to switch between both buffers.
- * You can also use drmModePageFlip() to do a vsync'ed pageflip. But this is
- * beyond the scope of this document.
+ * If you run this example, you will notice that there is almost no flickering,
+ * anymore. The buffers are now swapped as a whole so each new frame shows
+ * always the whole new image. If you look carefully, you will notice that the
+ * modeset.c example showed many screen corruptions during redraw-cycles.
+ *
+ * However, this example is still not perfect. Imagine the display-controller is
+ * currently scanning out a new image and we call drmModeSetCrtc()
+ * simultaneously. It will then have the same effect as if we used a single
+ * buffer and we get some tearing. But, the chance that this happens is a lot
+ * less likely as with a single-buffer. This is because there is a long period
+ * between each frame called vertical-blank where the display-controller does
+ * not perform a scanout. If we swap the buffers in this period, we have the
+ * guarantee that there will be no tearing. See the modeset-vsync.c example if
+ * you want to know how you can guarantee that the swap takes place at a
+ * vertical-sync.
  */
 
-static void modeset_draw(void) {
+static void modeset_draw(int fd) {
   uint8_t r, g, b;
   bool r_up, g_up, b_up;
   unsigned int i, j, k, off;
   struct modeset_dev *iter;
+  struct modeset_buf *buf;
+  int ret;
 
   srand(time(NULL));
   r = rand() % 0xff;
@@ -631,12 +543,21 @@ static void modeset_draw(void) {
     b = next_color(&b_up, b, 5);
 
     for (iter = modeset_list; iter; iter = iter->next) {
-      for (j = 0; j < iter->height; ++j) {
-        for (k = 0; k < iter->width; ++k) {
-          off = iter->stride * j + k * 4;
-          *(uint32_t *)&iter->map[off] = (r << 16) | (g << 8) | b;
+      buf = &iter->bufs[iter->front_buf ^ 1];
+      for (j = 0; j < buf->height; ++j) {
+        for (k = 0; k < buf->width; ++k) {
+          off = buf->stride * j + k * 4;
+          *(uint32_t *)&buf->map[off] = (r << 16) | (g << 8) | b;
         }
       }
+
+      ret = drmModeSetCrtc(fd, iter->crtc, buf->fb, 0, 0, &iter->conn, 1,
+                           &iter->mode);
+      if (ret)
+        fprintf(stderr, "cannot flip CRTC for connector %u (%d): %m\n",
+                iter->conn, errno);
+      else
+        iter->front_buf ^= 1;
     }
 
     usleep(100000);
@@ -644,15 +565,12 @@ static void modeset_draw(void) {
 }
 
 /*
- * modeset_cleanup(fd): This cleans up all the devices we created during
- * modeset_prepare(). It resets the CRTCs to their saved states and deallocates
- * all memory.
- * It should be pretty obvious how all of this works.
+ * modeset_cleanup() stays the same as before. But it now calls
+ * modeset_destroy_fb() instead of accessing the framebuffers directly.
  */
 
 static void modeset_cleanup(int fd) {
   struct modeset_dev *iter;
-  struct drm_mode_destroy_dumb dreq;
 
   while (modeset_list) {
     /* remove from global list */
@@ -665,16 +583,9 @@ static void modeset_cleanup(int fd) {
                    &iter->saved_crtc->mode);
     drmModeFreeCrtc(iter->saved_crtc);
 
-    /* unmap buffer */
-    munmap(iter->map, iter->size);
-
-    /* delete framebuffer */
-    drmModeRmFB(fd, iter->fb);
-
-    /* delete dumb buffer */
-    memset(&dreq, 0, sizeof(dreq));
-    dreq.handle = iter->handle;
-    drmIoctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dreq);
+    /* destroy framebuffers */
+    modeset_destroy_fb(fd, &iter->bufs[1]);
+    modeset_destroy_fb(fd, &iter->bufs[0]);
 
     /* free allocated memory */
     free(iter);
@@ -682,17 +593,17 @@ static void modeset_cleanup(int fd) {
 }
 
 /*
- * I hope this was a short but easy overview of the DRM modesetting API. The DRM
- * API offers much more capabilities including:
- *  - double-buffering or tripple-buffering (or whatever you want)
- *  - vsync'ed page-flips
- *  - hardware-accelerated rendering (for example via OpenGL)
- *  - output cloning
- *  - graphics-clients plus authentication
- *  - DRM planes/overlays/sprites
- *  - ...
- * If you are interested in these topics, I can currently only redirect you to
- * existing implementations, including:
+ * This was a very short extension to the basic modesetting example that shows
+ * how double-buffering is implemented. Double-buffering is the de-facto
+ * standard in any graphics application so any other example will be based on
+ * this. It is important to understand the ideas behind it as the code is pretty
+ * easy and short compared to modeset.c.
+ *
+ * Double-buffering doesn't solve all problems. Vsync'ed page-flips solve most
+ * of the problems that still occur, but has problems on it's own (see
+ * modeset-vsync.c for a discussion).
+ *
+ * If you want more code, I can recommend reading the source-code of:
  *  - plymouth (which uses dumb-buffers like this example; very easy to
  * understand)
  *  - kmscon (which uses libuterm to do this)
@@ -700,9 +611,6 @@ static void modeset_cleanup(int fd) {
  *             uses more complicated techniques like DRM planes)
  *  - xserver (very hard to understand as it is split across many
  * files/projects)
- *
- * But understanding how modesetting (as described in this document) works, is
- * essential to understand all further DRM topics.
  *
  * Any feedback is welcome. Feel free to use this code freely for your own
  * documentation or projects.
